@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Minimal PostgreSQL startup script with full paths
+# PostgreSQL startup and migration script
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
@@ -14,62 +14,51 @@ PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
 echo "Found PostgreSQL version: ${PG_VERSION}"
 
+# Function to run SQL file with psql against DB_NAME
+run_sql_file() {
+  local file_path="$1"
+  if [ -f "$file_path" ]; then
+    echo "Applying migration: $file_path"
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -f "$file_path" || {
+      echo "Migration failed for $file_path"
+      exit 1
+    }
+  else
+    echo "Skipped missing migration file: $file_path"
+  fi
+}
+
 # Check if PostgreSQL is already running on the specified port
 if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-    echo "PostgreSQL is already running on port ${DB_PORT}!"
-    echo "Database: ${DB_NAME}"
-    echo "User: ${DB_USER}"
-    echo "Port: ${DB_PORT}"
-    echo ""
-    echo "To connect to the database, use:"
-    echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-    
-    # Check if connection info file exists
-    if [ -f "db_connection.txt" ]; then
-        echo "Or use: $(cat db_connection.txt)"
+    echo "PostgreSQL is already running on port ${DB_PORT}."
+else
+    # Also check if there's a PostgreSQL process running (in case pg_isready fails)
+    if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
+        echo "Found existing PostgreSQL process on port ${DB_PORT}"
+    else
+        # Initialize PostgreSQL data directory if it doesn't exist
+        if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
+            echo "Initializing PostgreSQL..."
+            sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
+        fi
+
+        # Start PostgreSQL server in background
+        echo "Starting PostgreSQL server..."
+        sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+        sleep 2
     fi
-    
-    echo ""
-    echo "Script stopped - server already running."
-    exit 0
+
+    # Wait for PostgreSQL to start
+    echo "Waiting for PostgreSQL to become ready..."
+    for i in {1..20}; do
+        if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
+            echo "PostgreSQL is ready!"
+            break
+        fi
+        echo "Waiting... ($i/20)"
+        sleep 1
+    done
 fi
-
-# Also check if there's a PostgreSQL process running (in case pg_isready fails)
-if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
-    echo "Found existing PostgreSQL process on port ${DB_PORT}"
-    echo "Attempting to verify connection..."
-    
-    # Try to connect and verify the database exists
-    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
-        echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
-    fi
-fi
-
-# Initialize PostgreSQL data directory if it doesn't exist
-if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
-    echo "Initializing PostgreSQL..."
-    sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
-fi
-
-# Start PostgreSQL server in background
-echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
-
-# Wait for PostgreSQL to start
-echo "Waiting for PostgreSQL to start..."
-sleep 5
-
-# Check if PostgreSQL is running
-for i in {1..15}; do
-    if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-        echo "PostgreSQL is ready!"
-        break
-    fi
-    echo "Waiting... ($i/15)"
-    sleep 2
-done
 
 # Create database and user
 echo "Setting up database and user..."
@@ -89,44 +78,24 @@ END
 
 -- Grant database-level permissions
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+EOF
 
--- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
-
--- For PostgreSQL 15+, we need to handle public schema permissions differently
--- First, grant usage on public schema
+# Ensure schema-level permissions inside target DB
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
+-- Grant access to public schema
 GRANT USAGE ON SCHEMA public TO ${DB_USER};
-
--- Grant CREATE permission on public schema
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
--- Make the user owner of all future objects they create in public schema
+-- Default privileges for future objects
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
--- Alternative: Grant all privileges on schema public to the user
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-
--- Ensure the user can work with any existing objects
+-- Ensure current objects are accessible
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
-EOF
-
-# Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
--- Double-check permissions are set correctly in the target database
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-GRANT CREATE ON SCHEMA public TO ${DB_USER};
-
--- Show current permissions for debugging
-\dn+ public
 EOF
 
 # Save connection command to a file
@@ -142,11 +111,23 @@ export POSTGRES_DB="${DB_NAME}"
 export POSTGRES_PORT="${DB_PORT}"
 EOF
 
+# Apply SQL migrations in order (idempotent files)
+MIGRATIONS_DIR="$(pwd)/sql"
+if [ -d "$MIGRATIONS_DIR" ]; then
+  echo "Applying database migrations from $MIGRATIONS_DIR ..."
+  run_sql_file "$MIGRATIONS_DIR/001_init.sql"
+  run_sql_file "$MIGRATIONS_DIR/002_indexes.sql"
+  run_sql_file "$MIGRATIONS_DIR/003_seed.sql"
+  run_sql_file "$MIGRATIONS_DIR/004_views.sql"
+  echo "Migrations applied successfully."
+else
+  echo "No migrations directory found at $MIGRATIONS_DIR"
+fi
+
 echo "PostgreSQL setup complete!"
 echo "Database: ${DB_NAME}"
 echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
-echo ""
 
 echo "Environment variables saved to db_visualizer/postgres.env"
 echo "To use with Node.js viewer, run: source db_visualizer/postgres.env"
